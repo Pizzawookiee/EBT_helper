@@ -244,3 +244,217 @@ MVP includes inbound voice prep, multilingual intake, applicant packet generatio
 - SNAP/DTA official review happens only when the applicant submits the packet through official channels or a formal DTA/community-partner workflow exists.
 - Automatic rescheduling is limited to official DTA-supported mechanisms; otherwise the system creates a navigator follow-up task.
 - Inbound voice is the v1 default; outbound AI calls require separate compliance approval, consent capture, and caller-ID readiness.
+
+## Four-Contributor Implementation Plan
+
+The repo currently contains a monorepo scaffold with `apps/api` and `apps/web`. The API already has route/service boundaries for voice intake, extraction, privacy, packet generation, sessions, navigator tasks, retention, reminders, config, and Drizzle schema. The web app has a package scaffold but no visible app source yet. The API imports `@ebt/types`, but no `packages/types` package exists in the repo yet; creating that shared package is the first cross-team dependency.
+
+### Shared Contract For All Contributors
+
+- Create `packages/types` as `@ebt/types` before feature work begins.
+- Define shared TypeScript types and Zod schemas for:
+  - `SupportedLanguage`: `en | es | pt | ht | zh | vi | ar` for MVP, with unsupported languages routed to navigator review.
+  - `IntakeStage`: `LANGUAGE_SELECT | CONSENT | RECORDING_CONSENT | SESSION_BINDING | SCOPE_ID | TIMELINE | PREP | DOCUMENTS | WRAP_UP | COMPLETED | ABANDONED`.
+  - `ConsentState`: AI intake consent, recording/transcript consent, SMS consent, outbound callback consent, external sharing authorization, revocation timestamps.
+  - `SessionBinding`: phone number hash, preferred name, safe callback preference, optional one-time code verification, optional DTA Agency ID or application/case reference.
+  - `ApplicationTimeline`: application date, method, confirmation status, expected/scheduled interview date, call outcome, reschedule status, DTA ID status.
+  - `HouseholdInfo`, `IncomeInfo`, `ExpenseInfo`, `DocumentStatus`, `AccommodationNeeds`, `SensitiveFieldWarning`, `NavigatorFlag`, `ApplicantPacket`, `WorkerPacket`, `NavigatorTask`, `AuditEvent`, and `SourceCitation`.
+- Shared API response shape:
+  - Successful responses return `{ data: ... }`.
+  - Errors return `{ error: { code: string, message: string, details?: unknown } }`.
+  - All PII-bearing responses must be redacted by default unless a navigator has assigned-case access.
+- Shared acceptance gate:
+  - `npm run build` passes for all workspaces.
+  - Any new endpoint has request/response schemas, validation, and at least one happy-path and one privacy/safety test.
+
+### Contributor 1: Voice Intake And Consent
+
+Owns inbound call behavior in `apps/api/src/routes/voice.ts` and `apps/api/src/services/voice-agent.ts`.
+
+Features:
+
+- Implement inbound-only MVP call flow with explicit stage transitions:
+  - Language selection.
+  - AI intake consent.
+  - Separate recording/transcript consent.
+  - Session binding for new/resumed calls.
+  - Application timeline collection.
+  - Household/income/expense/document prompts.
+  - Wrap-up with official DTA next steps.
+- Replace in-memory-only call state with Redis-backed `callSid -> sessionId` mapping.
+- Store incremental state updates instead of waiting until call end.
+- Add dropped-call resume behavior using low-risk session binding fields.
+- Add live handoff trigger when the caller asks for a person, refuses AI, has accessibility needs the bot cannot support, or hits high-risk privacy/legal flags.
+- Keep outbound voice disabled except for a blocked/stub path that verifies prior express consent and creates a navigator task instead of placing the call.
+
+Inputs:
+
+- Twilio webhook body: `CallSid`, `From`, `To`, `CallStatus`, `SpeechResult`, `Digits`.
+- Config: community org name, DTA contact config, retention settings, supported languages, Redis URL.
+- Existing or new session binding record.
+
+Outputs:
+
+- TwiML responses for every stage.
+- Updated `intake_sessions` fields: language, consent state, contact preferences, session binding summary, application timeline, transcript-retention mode.
+- `audit_events` for consent, stage changes, dropped-call resume, guardrail triggers, and handoff requests.
+- `navigator_tasks` for missed interview, possible expedited service, DTA Connect help, language/accessibility need, live handoff, sensitive/legal issue, and outbound-call blocked.
+
+Acceptance criteria:
+
+- A caller can complete the full intake without raw audio retention.
+- A caller who declines recording still gets a structured packet path.
+- A dropped call can resume without asking for full SSN or DTA login credentials.
+- A caller who says an EBT PIN/password is interrupted before the agent continues and the value is not stored in plain text.
+
+### Contributor 2: Extraction, Knowledge Base, And Packets
+
+Owns `apps/api/src/services/extraction.ts`, `apps/api/src/services/packet.ts`, and the new source-grounded knowledge-base layer.
+
+Features:
+
+- Replace free-form document guidance with a vetted DTA/SNAP knowledge base:
+  - Store source entries with URL, title, last-verified date, jurisdiction, category, and plain-language guidance.
+  - Treat DTA phone numbers, hours, DTA Connect URL, office URL, expedited timeline, interpreter notes, and common document categories as configurable sourced records.
+  - Generate checklist items only from source records or applicant-provided DTA notices.
+- Extend extraction to return:
+  - Application timeline fields.
+  - Consent-independent facts.
+  - Possible expedited indicators with reason codes.
+  - Document availability and uncertainty labels.
+  - Accommodation needs and output-language preference.
+  - Contradictions/uncertainties requiring navigator review.
+- Add packet generation with source citations:
+  - Applicant packet in preferred language and English when needed.
+  - Worker-readable packet with confidence labels and "not an eligibility determination" disclaimer.
+  - DTA call script using configured/sourced DTA contact info, not hardcoded text.
+- Add hallucination controls:
+  - Any item not backed by a source citation must be labeled `uncertain` or omitted.
+  - "Required" may only be used when backed by a DTA notice or vetted official source.
+
+Inputs:
+
+- Redacted transcript lines and structured session state.
+- Vetted knowledge-base records.
+- Applicant-reported document statuses.
+- Navigator-edited corrections.
+
+Outputs:
+
+- `ExtractionOutput` JSON validated by Zod.
+- `ApplicantPacket` JSON with summary, timeline, checklist, call script, next steps, language, and source citations.
+- `WorkerPacket` JSON with household/income/expense summaries, missing verifications, flags, confidence labels, and source citations.
+- Packet records in `packets`.
+- Audit events for packet generation, navigator edit, export, and source version used.
+
+Acceptance criteria:
+
+- The motivating May 27/June 1 scenario appears only as case data, not hardcoded packet text.
+- A checklist cannot call a document "required" without a source citation.
+- Possible expedited service flags mention the 7-day review path as a review flag, not a promise of approval.
+- Packet generation still works when the applicant has no DTA Agency ID.
+
+### Contributor 3: Privacy, Security, Data Model, And Jobs
+
+Owns `apps/api/src/db/schema.ts`, `apps/api/src/services/privacy.ts`, `apps/api/src/jobs/retention.ts`, `apps/api/src/jobs/reminders.ts`, and API-wide auth/audit middleware.
+
+Features:
+
+- Update schema for the shared contract:
+  - Add consent fields, session binding fields, application timeline fields, accommodation fields, source citations, and packet review status.
+  - Split minimized audit logs from case records so audit survives case deletion without retaining packet content or unnecessary PII.
+  - Add assignment fields needed for RBAC.
+- Implement privacy and security controls:
+  - Field-level encryption or application-layer encryption for PII-bearing Postgres fields.
+  - KMS/secrets-manager integration abstraction.
+  - RBAC middleware requiring assigned navigator access for session/packet reads.
+  - SSO/MFA-ready auth abstraction, with `x-navigator-id` allowed only in local/dev mode.
+  - PII masking by default in list responses.
+- Harden secret detection:
+  - Real-time phrase detection for EBT PIN, full SSN, DTA Connect password, bank password, account login, and payment credentials.
+  - Post-call transcript scrub before storage.
+  - Incident audit event when forbidden secrets are captured.
+- Implement retention:
+  - Raw audio off by default.
+  - Transcript deletion at 30 days unless consented follow-up requires shorter/longer configured retention.
+  - Packet/case deletion at 90 days unless ongoing help is active.
+  - Minimized audit retention for at least 1 year after case deletion.
+- Implement reminder/privacy-safe notification jobs:
+  - Stale navigator task reminders without PII in logs.
+  - Deletion reminders and completed deletion audit events.
+
+Inputs:
+
+- Session, packet, consent, and task data from API services.
+- Environment config for retention, encryption, auth mode, and vendor retention mode.
+- Navigator identity and assignment information.
+
+Outputs:
+
+- Drizzle schema and migrations for the agreed data contract.
+- Authenticated/redacted API responses.
+- Audit events for view, edit, export, share, delete, consent change, assignment, and incident.
+- Retention job results that delete PII while preserving minimized audit records.
+
+Acceptance criteria:
+
+- Deleting a case removes packet contents and PII but preserves a minimized audit trail.
+- An unassigned navigator cannot view a session or packet.
+- List endpoints do not expose detailed PII.
+- Forbidden secrets are redacted before transcript storage and never appear in logs.
+
+### Contributor 4: Navigator Web App And Workflow UX
+
+Owns `apps/web` and the navigator-facing workflow that consumes the API.
+
+Features:
+
+- Build navigator dashboard views:
+  - Queue view grouped by urgency: possible expedited, missed interview/no reschedule, live handoff, language/accessibility, DTA Connect help, sensitive/legal, normal prep.
+  - Session detail view with masked PII, consent state, timeline, extracted facts, uncertainty flags, and source citations.
+  - Packet review/editor for applicant packet and worker-readable packet.
+  - Export/share flow that requires explicit applicant authorization and records destination/channel.
+  - Live handoff panel for callers who need a human.
+  - Deletion/revocation controls for applicant requests.
+- Build frontend guardrails:
+  - Show disclaimers that packet is not an eligibility determination.
+  - Block export until navigator review is complete and sharing authorization exists.
+  - Show source citations beside checklist items.
+  - Warn when an applicant may have expedited-service indicators.
+  - Use compact operational UI, not a landing page.
+- Define API consumption:
+  - `GET /navigator/queue` for work queue.
+  - `PATCH /navigator/tasks/:id` for assignment/status/note.
+  - `GET /sessions/:id` for detail.
+  - `PATCH /sessions/:id` for navigator corrections.
+  - Add packet endpoints if missing: `POST /sessions/:id/packets`, `GET /sessions/:id/packets`, `PATCH /packets/:id/review`, `POST /packets/:id/export`.
+
+Inputs:
+
+- Navigator identity/auth context.
+- Queue items, sessions, tasks, packets, audit summaries, consent states, and source citations from the API.
+- Navigator edits and review decisions.
+
+Outputs:
+
+- Reviewed applicant and worker packets.
+- Task assignments, notes, and status changes.
+- Export/share events with channel, destination type, consent reference, and timestamp.
+- Applicant deletion/revocation requests sent to API.
+
+Acceptance criteria:
+
+- A navigator can triage the queue without seeing unnecessary PII.
+- A navigator can review and approve a packet before export.
+- Export is blocked without sharing authorization.
+- Possible expedited and missed-interview cases are visually prioritized.
+- The UI supports translated applicant outputs and English worker/navigator review.
+
+### Integration Milestones
+
+- Milestone 1: shared `@ebt/types` package compiles; API imports resolve; web can import queue/session/packet types.
+- Milestone 2: inbound call creates a session, captures consent, stores session binding, and creates a navigator task.
+- Milestone 3: extraction and packet generation produce source-grounded applicant/worker packets for a redacted transcript.
+- Milestone 4: navigator dashboard can review, edit, approve, and export a packet with audit logging.
+- Milestone 5: retention, deletion, RBAC, secret redaction, and consent revocation pass privacy test scenarios.
+- Milestone 6: end-to-end demo covers the configurable May 27/June 1 missed-interview scenario without duplicate reapplication, with an applicant packet, worker packet, and navigator task.
